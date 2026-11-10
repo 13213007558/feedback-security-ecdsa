@@ -5,12 +5,13 @@ Primary classes for performing signing and verification operations.
 import binascii
 from hashlib import sha1
 import os
-from six import PY2
+from six import PY2, int2byte
 from . import ecdsa, eddsa
 from . import der, ssh
 from . import rfc6979
 from . import ellipticcurve
-from .curves import NIST192p, Curve, Ed25519, Ed448
+from . import numbertheory
+from .curves import NIST192p, Curve, Ed25519, Ed448, SECP256k1
 from .ecdsa import RSZeroError
 from .util import string_to_number, number_to_string, randrange
 from .util import sigencode_string, sigdecode_string, bit_length
@@ -21,7 +22,7 @@ from .util import (
     oid_ecMQV,
     MalformedSignature,
 )
-from ._compat import normalise_bytes
+from ._compat import normalise_bytes, str_idx_as_int
 from .errors import MalformedPointError
 from .ellipticcurve import PointJacobi, CurveEdTw
 
@@ -520,6 +521,191 @@ class VerifyingKey(object):
             cls.from_public_point(pk.point, curve, hashfunc) for pk in pks
         ]
         return verifying_keys
+
+    @classmethod
+    def from_recoverable_signature(
+        cls,
+        signature,
+        data,
+        curve=SECP256k1,
+        hashfunc=sha1,
+        allow_truncate=True,
+    ):
+        """
+        Recover the verifying key from a compact recoverable signature.
+
+        The ``data`` is hashed with ``hashfunc`` before recovery, use
+        :func:`~VerifyingKey.from_recoverable_signature_with_digest` if
+        you already have the message digest.
+
+        The signature must use the secp256k1-specific 65 byte format:
+        one recovery id byte followed by 32 byte big-endian ``r`` and
+        32 byte big-endian ``s``, as produced by
+        :func:`~SigningKey.sign_recoverable` and
+        :func:`~SigningKey.sign_digest_recoverable`.
+
+        The recovered key is used to verify the signature before it is
+        returned, so a successfully returned key is guaranteed to be a
+        key for which the signature is valid for the hash of ``data``.
+
+        :param signature: the 65 byte recoverable signature
+        :type signature: bytes-like object
+        :param data: the message that was signed, it will be hashed with
+            ``hashfunc`` before recovery
+        :type data: bytes-like object
+        :param curve: must be :data:`~ecdsa.curves.SECP256k1`, the fixed
+            length format is not defined for other curves
+        :type curve: ~ecdsa.curves.Curve
+        :param hashfunc: The hash function used for hashing the provided
+            ``data`` and the default hash function of the returned key.
+            Needs to implement the same interface as hashlib.sha1
+        :type hashfunc: callable
+        :param bool allow_truncate: if True, the provided hashfunc can
+            generate values larger than the bit size of the order of the
+            curve, the extra bits (at the end of the digest) will be
+            truncated.
+
+        :raises ValueError: if ``curve`` is not secp256k1
+        :raises MalformedSignature: if the signature encoding is malformed
+            or no valid point can be recovered from it
+        :raises BadSignatureError: if the recovered key does not verify
+            the signature
+
+        :return: Initialised VerifyingKey object
+        :rtype: VerifyingKey
+        """
+        data = normalise_bytes(data)
+        digest = hashfunc(data).digest()
+        return cls.from_recoverable_signature_with_digest(
+            signature,
+            digest,
+            curve=curve,
+            hashfunc=hashfunc,
+            allow_truncate=allow_truncate,
+        )
+
+    @classmethod
+    def from_recoverable_signature_with_digest(
+        cls,
+        signature,
+        digest,
+        curve=SECP256k1,
+        hashfunc=sha1,
+        allow_truncate=False,
+    ):
+        """
+        Recover the verifying key from a compact recoverable signature.
+
+        The ``digest`` is used as-is, it is NOT hashed again, use
+        :func:`~VerifyingKey.from_recoverable_signature` if you have the
+        message and want it hashed for you.
+
+        The signature must use the secp256k1-specific 65 byte format:
+        one recovery id byte followed by 32 byte big-endian ``r`` and
+        32 byte big-endian ``s``, as produced by
+        :func:`~SigningKey.sign_recoverable` and
+        :func:`~SigningKey.sign_digest_recoverable`.
+
+        The recovered key is used to verify the signature before it is
+        returned, so a successfully returned key is guaranteed to be a
+        key for which the signature is valid for ``digest``.
+
+        :param signature: the 65 byte recoverable signature
+        :type signature: bytes-like object
+        :param digest: the hash value of the signed message
+        :type digest: bytes-like object
+        :param curve: must be :data:`~ecdsa.curves.SECP256k1`, the fixed
+            length format is not defined for other curves
+        :type curve: ~ecdsa.curves.Curve
+        :param hashfunc: The default hash function of the returned key,
+            needs to implement the same interface as hashlib.sha1
+        :type hashfunc: callable
+        :param bool allow_truncate: if True, the provided digest can have
+            bigger bit-size than the order of the curve, the extra bits
+            (at the end of the digest) will be truncated.
+
+        :raises ValueError: if ``curve`` is not secp256k1
+        :raises MalformedSignature: if the signature encoding is malformed
+            or no valid point can be recovered from it
+        :raises BadSignatureError: if the recovered key does not verify
+            the signature
+
+        :return: Initialised VerifyingKey object
+        :rtype: VerifyingKey
+        """
+        if curve != SECP256k1:
+            raise ValueError(
+                "Recoverable signatures are supported only for secp256k1"
+            )
+        signature = normalise_bytes(signature)
+        if len(signature) != 1 + 2 * curve.baselen:
+            raise MalformedSignature(
+                "Recoverable secp256k1 signatures must be exactly {0} "
+                "bytes long, got {1}".format(
+                    1 + 2 * curve.baselen, len(signature)
+                )
+            )
+        recid = str_idx_as_int(signature, 0)
+        if recid > 3:
+            raise MalformedSignature(
+                "Invalid recovery id: {0}".format(recid)
+            )
+        order = curve.order
+        r = string_to_number(signature[1 : 1 + curve.baselen])
+        s = string_to_number(signature[1 + curve.baselen :])
+        if not 1 <= r < order or not 1 <= s < order:
+            raise MalformedSignature("r or s out of range for the curve")
+
+        p = curve.curve.p()
+        x = r + (recid >> 1) * order
+        if x >= p:
+            raise MalformedSignature(
+                "Recovery id implies x coordinate out of range"
+            )
+        alpha = (
+            pow(x, 3, p) + curve.curve.a() * x + curve.curve.b()
+        ) % p
+        try:
+            beta = numbertheory.square_root_mod_prime(alpha, p)
+        except numbertheory.SquareRootError:
+            raise MalformedSignature(
+                "No point on the curve with the required x coordinate"
+            )
+        if (beta & 1) == (recid & 1):
+            y = beta
+        else:
+            y = p - beta
+
+        generator = curve.generator
+        R = ellipticcurve.PointJacobi(curve.curve, x, y, 1, order)
+        if order * R != ellipticcurve.INFINITY:
+            raise MalformedSignature(
+                "Recovered point is not in the correct subgroup"
+            )
+
+        digest = normalise_bytes(digest)
+        e = _truncate_and_convert_digest(digest, curve, allow_truncate)
+        Q = numbertheory.inverse_mod(r, order) * (
+            s * R + (-e % order) * generator
+        )
+        if Q == ellipticcurve.INFINITY:
+            raise BadSignatureError(
+                "Recovery resulted in the point at infinity"
+            )
+        verifying_key = cls.from_public_point(Q, curve, hashfunc)
+
+        # recovering a point is not enough - the recovered key must
+        # actually verify the signature over the digest
+        if not verifying_key.verify_digest(
+            number_to_string(r, order) + number_to_string(s, order),
+            digest,
+            sigdecode=sigdecode_string,
+            allow_truncate=allow_truncate,
+        ):
+            raise BadSignatureError(
+                "Recovered key does not verify the signature"
+            )
+        return verifying_key
 
     def to_string(self, encoding="raw"):
         """
@@ -1453,6 +1639,169 @@ class SigningKey(object):
                 retry_gen += 1
 
         return sigencode(r, s, order)
+
+    def sign_recoverable(
+        self,
+        data,
+        hashfunc=None,
+        extra_entropy=b"",
+        low_s=False,
+    ):
+        """
+        Create a compact recoverable signature over data.
+
+        The ``data`` is hashed with ``hashfunc`` before signing, use
+        :func:`~SigningKey.sign_digest_recoverable` if you already have
+        the message digest.
+
+        Uses the deterministic RFC6979 algorithm for nonce generation
+        and works only with the secp256k1 curve.
+
+        The signature is 65 bytes long: one recovery id byte followed by
+        32 byte big-endian ``r`` and 32 byte big-endian ``s``. The
+        recovery id encodes the parity of the ``y`` coordinate of the
+        nonce point (bit 0) and whether its ``x`` coordinate was reduced
+        modulo the curve order (bit 1). It allows
+        :func:`~VerifyingKey.from_recoverable_signature` to recover the
+        public key that created the signature.
+
+        :param data: data that will be hashed for signing
+        :type data: :term:`bytes-like object`
+        :param hashfunc: hash function to use for hashing the provided
+            ``data`` and for computing the random "k" value from the
+            RFC6979 process. If unspecified, the default hash function
+            selected during object initialisation will be used (see
+            :attr:`.VerifyingKey.default_hashfunc`). The object needs to
+            implement the same interface as :func:`~hashlib.sha1` from
+            :py:mod:`hashlib`.
+        :type hashfunc: callable
+        :param extra_entropy: additional data that will be fed into the
+            random number generator used in the RFC6979 process.
+            Entirely optional.
+        :type extra_entropy: :term:`bytes-like object`
+        :param bool low_s: if True, the ``s`` value of the signature is
+            normalised to the lower half of the curve order and the
+            recovery id is adjusted accordingly, so that recovery still
+            yields the key that created the signature.
+
+        :raises ValueError: if the key is not on the secp256k1 curve
+
+        :return: 65 byte recoverable signature of the hash of `data`
+        :rtype: bytes
+        """
+        if self.curve != SECP256k1:
+            raise ValueError(
+                "Recoverable signatures are supported only for secp256k1"
+            )
+        hashfunc = hashfunc or self.default_hashfunc
+        data = normalise_bytes(data)
+        digest = hashfunc(data).digest()
+        return self.sign_digest_recoverable(
+            digest,
+            hashfunc=hashfunc,
+            extra_entropy=extra_entropy,
+            allow_truncate=True,
+            low_s=low_s,
+        )
+
+    def sign_digest_recoverable(
+        self,
+        digest,
+        hashfunc=None,
+        extra_entropy=b"",
+        allow_truncate=False,
+        low_s=False,
+    ):
+        """
+        Create a compact recoverable signature for digest.
+
+        The ``digest`` is used as-is, it is NOT hashed again, use
+        :func:`~SigningKey.sign_recoverable` if you have the message and
+        want it hashed for you.
+
+        Uses the deterministic RFC6979 algorithm for nonce generation
+        and works only with the secp256k1 curve.
+
+        The signature is 65 bytes long: one recovery id byte followed by
+        32 byte big-endian ``r`` and 32 byte big-endian ``s``. The
+        recovery id encodes the parity of the ``y`` coordinate of the
+        nonce point (bit 0) and whether its ``x`` coordinate was reduced
+        modulo the curve order (bit 1). It allows
+        :func:`~VerifyingKey.from_recoverable_signature_with_digest` to
+        recover the public key that created the signature.
+
+        :param digest: hash of data that will be signed
+        :type digest: :term:`bytes-like object`
+        :param hashfunc: hash function to use for computing the random
+            "k" value from the RFC6979 process, if unspecified, the
+            default hash function selected during object initialisation
+            will be used (see :attr:`.VerifyingKey.default_hashfunc`).
+            The object needs to implement the same interface as
+            :func:`~hashlib.sha1` from :py:mod:`hashlib`.
+        :type hashfunc: callable
+        :param extra_entropy: additional data that will be fed into the
+            random number generator used in the RFC6979 process.
+            Entirely optional.
+        :type extra_entropy: :term:`bytes-like object`
+        :param bool allow_truncate: if True, the provided digest can have
+            bigger bit-size than the order of the curve, the extra bits
+            (at the end of the digest) will be truncated.
+        :param bool low_s: if True, the ``s`` value of the signature is
+            normalised to the lower half of the curve order and the
+            recovery id is adjusted accordingly, so that recovery still
+            yields the key that created the signature.
+
+        :raises ValueError: if the key is not on the secp256k1 curve
+
+        :return: 65 byte recoverable signature for the `digest` hash
+        :rtype: bytes
+        """
+        if self.curve != SECP256k1:
+            raise ValueError(
+                "Recoverable signatures are supported only for secp256k1"
+            )
+        secexp = self.privkey.secret_multiplier
+        hashfunc = hashfunc or self.default_hashfunc
+        digest = normalise_bytes(digest)
+        extra_entropy = normalise_bytes(extra_entropy)
+        order = self.privkey.order
+
+        number = _truncate_and_convert_digest(
+            digest, self.curve, allow_truncate
+        )
+
+        retry_gen = 0
+        while True:
+            k = rfc6979.generate_k(
+                order,
+                secexp,
+                hashfunc,
+                digest,
+                retry_gen=retry_gen,
+                extra_entropy=extra_entropy,
+            )
+            try:
+                r, s = self.sign_number(number, k=k)
+                break
+            except RSZeroError:
+                retry_gen += 1
+
+        # the nonce point determines which of the candidate points the
+        # recovery process needs to pick
+        R = k * self.curve.generator
+        recid = (R.y() & 1) | (2 if R.x() >= order else 0)
+        if low_s and s > order // 2:
+            # negating s negates the nonce point in the recovery
+            # equation, so the parity bit must be flipped to keep
+            # pointing at the same public key
+            s = order - s
+            recid ^= 1
+
+        return (
+            int2byte(recid)
+            + number_to_string(r, order)
+            + number_to_string(s, order)
+        )
 
     def sign(
         self,
