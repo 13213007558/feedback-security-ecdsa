@@ -24,6 +24,7 @@ from .util import (
 from ._compat import normalise_bytes
 from .errors import MalformedPointError
 from .ellipticcurve import PointJacobi, CurveEdTw
+from .curve_policy import CurveAdmissionError
 
 
 __all__ = [
@@ -133,7 +134,12 @@ class VerifyingKey(object):
 
     @classmethod
     def from_public_point(
-        cls, point, curve=NIST192p, hashfunc=sha1, validate_point=True
+        cls,
+        point,
+        curve=NIST192p,
+        hashfunc=sha1,
+        validate_point=True,
+        curve_policy=None,
     ):
         """
         Initialise the object from a Point object.
@@ -152,9 +158,15 @@ class VerifyingKey(object):
         :type bool validate_point: whether to check if the point lays on curve
             should always be used if the public point is not a result
             of our own calculation
+        :param curve_policy: optional admission policy restricting which
+            curves are accepted. When ``None`` (the default) no curve check is
+            performed beyond the point validity checks.
+        :type curve_policy: ecdsa.curve_policy.CurvePolicy
 
         :raises MalformedPointError: if the public point does not lay on the
             curve
+        :raises ecdsa.curve_policy.CurveAdmissionError: if the curve is not
+            admitted by the policy
 
         :return: Initialised VerifyingKey object
         :rtype: VerifyingKey
@@ -162,6 +174,8 @@ class VerifyingKey(object):
         self = cls(_error__please_use_generate=True)
         if isinstance(curve.curve, CurveEdTw):
             raise ValueError("Method incompatible with Edwards curves")
+        if curve_policy is not None:
+            curve = curve_policy.admit_curve(curve)
         if not isinstance(point, ellipticcurve.PointJacobi):
             point = ellipticcurve.PointJacobi.from_affine(point)
         self.curve = curve
@@ -223,6 +237,7 @@ class VerifyingKey(object):
         hashfunc=sha1,
         validate_point=True,
         valid_encodings=None,
+        curve_policy=None,
     ):
         """
         Initialise the object from byte encoding of public key.
@@ -255,13 +270,23 @@ class VerifyingKey(object):
             name). All formats by default (specified with ``None``).
             Ignored for EdDSA.
         :type valid_encodings: :term:`set-like object`
+        :param curve_policy: optional admission policy restricting which
+            curves are accepted. The check is independent from
+            ``valid_encodings`` and never disables the point validity checks.
+            When ``None`` (the default) the historical behaviour is
+            preserved.
+        :type curve_policy: ecdsa.curve_policy.CurvePolicy
 
         :raises MalformedPointError: if the public point does not lay on the
             curve or the encoding is invalid
+        :raises ecdsa.curve_policy.CurveAdmissionError: if the curve is not
+            admitted by the policy
 
         :return: Initialised VerifyingKey object
         :rtype: VerifyingKey
         """
+        if curve_policy is not None:
+            curve = curve_policy.admit_curve(curve)
         if isinstance(curve.curve, CurveEdTw):
             self = cls(_error__please_use_generate=True)
             self.curve = curve
@@ -278,7 +303,13 @@ class VerifyingKey(object):
             validate_encoding=validate_point,
             valid_encodings=valid_encodings,
         )
-        return cls.from_public_point(point, curve, hashfunc, validate_point)
+        return cls.from_public_point(
+            point,
+            curve,
+            hashfunc,
+            validate_point,
+            curve_policy=curve_policy,
+        )
 
     @classmethod
     def from_pem(
@@ -287,6 +318,7 @@ class VerifyingKey(object):
         hashfunc=sha1,
         valid_encodings=None,
         valid_curve_encodings=None,
+        curve_policy=None,
     ):
         """
         Initialise from public key stored in :term:`PEM` format.
@@ -310,6 +342,9 @@ class VerifyingKey(object):
             for curve parameters. By default (``None``) all are supported:
             ``named_curve`` and ``explicit``.
         :type valid_curve_encodings: :term:`set-like object`
+        :param curve_policy: optional admission policy restricting which
+            curves are accepted; see :func:`~VerifyingKey.from_der`.
+        :type curve_policy: ecdsa.curve_policy.CurvePolicy
 
 
         :return: Initialised VerifyingKey object
@@ -320,6 +355,7 @@ class VerifyingKey(object):
             hashfunc=hashfunc,
             valid_encodings=valid_encodings,
             valid_curve_encodings=valid_curve_encodings,
+            curve_policy=curve_policy,
         )
 
     @classmethod
@@ -329,6 +365,7 @@ class VerifyingKey(object):
         hashfunc=sha1,
         valid_encodings=None,
         valid_curve_encodings=None,
+        curve_policy=None,
     ):
         """
         Initialise the key stored in :term:`DER` format.
@@ -363,6 +400,16 @@ class VerifyingKey(object):
             for curve parameters. By default (``None``) all are supported:
             ``named_curve`` and ``explicit``.
         :type valid_curve_encodings: :term:`set-like object`
+        :param curve_policy: optional admission policy restricting which
+            curves are accepted and whether explicit parameters are allowed.
+            It applies in addition to ``valid_encodings`` and
+            ``valid_curve_encodings`` and does not disable the point
+            validity checks. When ``None`` (the default) the historical
+            behaviour is preserved.
+        :type curve_policy: ecdsa.curve_policy.CurvePolicy
+
+        :raises ecdsa.curve_policy.CurveAdmissionError: if the curve of the
+            key is not admitted by the policy
 
         :return: Initialised VerifyingKey object
         :rtype: VerifyingKey
@@ -388,13 +435,17 @@ class VerifyingKey(object):
             point_str, empty = der.remove_bitstring(point_str_bitstring, 0)
             if empty:
                 raise der.UnexpectedDER("trailing junk after public key")
-            return cls.from_string(point_str, curve, None)
+            return cls.from_string(
+                point_str, curve, None, curve_policy=curve_policy
+            )
         if not oid_pk == oid_ecPublicKey:
             raise der.UnexpectedDER(
                 "Unexpected object identifier in DER "
                 "encoding: {0!r}".format(oid_pk)
             )
-        curve = Curve.from_der(rest, valid_curve_encodings)
+        curve = Curve.from_der(
+            rest, valid_curve_encodings, curve_policy=curve_policy
+        )
         point_str, empty = der.remove_bitstring(point_str_bitstring, 0)
         if empty != b"":
             raise der.UnexpectedDER(
@@ -409,6 +460,7 @@ class VerifyingKey(object):
             curve,
             hashfunc=hashfunc,
             valid_encodings=valid_encodings,
+            curve_policy=curve_policy,
         )
 
     @classmethod
@@ -831,7 +883,13 @@ class SigningKey(object):
         return cls._weierstrass_keygen(curve, entropy, hashfunc)
 
     @classmethod
-    def from_secret_exponent(cls, secexp, curve=NIST192p, hashfunc=sha1):
+    def from_secret_exponent(
+        cls,
+        secexp,
+        curve=NIST192p,
+        hashfunc=sha1,
+        curve_policy=None,
+    ):
         """
         Create a private key from a random integer.
 
@@ -846,9 +904,15 @@ class SigningKey(object):
             signing, needs to implement the same interface
             as hashlib.sha1
         :type hashfunc: callable
+        :param curve_policy: optional admission policy restricting which
+            curves are accepted. When ``None`` (the default) no curve check
+            is performed.
+        :type curve_policy: ecdsa.curve_policy.CurvePolicy
 
         :raises MalformedPointError: when the provided secexp is too large
             or too small for the curve selected
+        :raises ecdsa.curve_policy.CurveAdmissionError: if the curve is not
+            admitted by the policy
         :raises RuntimeError: if the generation of public key from private
             key failed
 
@@ -860,6 +924,8 @@ class SigningKey(object):
                 "Edwards keys don't support setting the secret scalar "
                 "(exponent) directly"
             )
+        if curve_policy is not None:
+            curve = curve_policy.admit_curve(curve)
         self = cls(_error__please_use_generate=True)
         self.curve = curve
         self.default_hashfunc = hashfunc
@@ -874,7 +940,7 @@ class SigningKey(object):
         if hasattr(pubkey_point, "scale"):
             pubkey_point = pubkey_point.scale()
         self.verifying_key = VerifyingKey.from_public_point(
-            pubkey_point, curve, hashfunc, False
+            pubkey_point, curve, hashfunc, False, curve_policy=curve_policy
         )
         pubkey = self.verifying_key.pubkey
         self.privkey = ecdsa.Private_key(pubkey, secexp)
@@ -882,7 +948,13 @@ class SigningKey(object):
         return self
 
     @classmethod
-    def from_string(cls, string, curve=NIST192p, hashfunc=sha1):
+    def from_string(
+        cls,
+        string,
+        curve=NIST192p,
+        hashfunc=sha1,
+        curve_policy=None,
+    ):
         """
         Decode the private key from :term:`raw encoding`.
 
@@ -898,9 +970,15 @@ class SigningKey(object):
             signing, needs to implement the same interface
             as hashlib.sha1
         :type hashfunc: callable
+        :param curve_policy: optional admission policy restricting which
+            curves are accepted. When ``None`` (the default) no curve check
+            is performed.
+        :type curve_policy: ecdsa.curve_policy.CurvePolicy
 
         :raises MalformedPointError: if the length of encoding doesn't match
             the provided curve or the encoded values is too large
+        :raises ecdsa.curve_policy.CurveAdmissionError: if the curve is not
+            admitted by the policy
         :raises RuntimeError: if the generation of public key from private
             key failed
 
@@ -915,20 +993,32 @@ class SigningKey(object):
                 "expected {1}".format(len(string), curve.baselen)
             )
         if isinstance(curve.curve, CurveEdTw):
+            if curve_policy is not None:
+                curve = curve_policy.admit_curve(curve)
             self = cls(_error__please_use_generate=True)
             self.curve = curve
             self.default_hashfunc = None  # Ignored for EdDSA
             self.baselen = curve.baselen
             self.privkey = eddsa.PrivateKey(curve.generator, string)
             self.verifying_key = VerifyingKey.from_string(
-                self.privkey.public_key().public_key(), curve
+                self.privkey.public_key().public_key(),
+                curve,
+                curve_policy=curve_policy,
             )
             return self
         secexp = string_to_number(string)
-        return cls.from_secret_exponent(secexp, curve, hashfunc)
+        return cls.from_secret_exponent(
+            secexp, curve, hashfunc, curve_policy=curve_policy
+        )
 
     @classmethod
-    def from_pem(cls, string, hashfunc=sha1, valid_curve_encodings=None):
+    def from_pem(
+        cls,
+        string,
+        hashfunc=sha1,
+        valid_curve_encodings=None,
+        curve_policy=None,
+    ):
         """
         Initialise from key stored in :term:`PEM` format.
 
@@ -952,6 +1042,9 @@ class SigningKey(object):
             for curve parameters. By default (``None``) all are supported:
             ``named_curve`` and ``explicit``.
         :type valid_curve_encodings: :term:`set-like object`
+        :param curve_policy: optional admission policy restricting which
+            curves are accepted; see :func:`~SigningKey.from_der`.
+        :type curve_policy: ecdsa.curve_policy.CurvePolicy
 
 
         :raises MalformedPointError: if the length of encoding doesn't match
@@ -977,10 +1070,17 @@ class SigningKey(object):
             der.unpem(string[private_key_index:]),
             hashfunc,
             valid_curve_encodings,
+            curve_policy=curve_policy,
         )
 
     @classmethod
-    def from_der(cls, string, hashfunc=sha1, valid_curve_encodings=None):
+    def from_der(
+        cls,
+        string,
+        hashfunc=sha1,
+        valid_curve_encodings=None,
+        curve_policy=None,
+    ):
         """
         Initialise from key stored in :term:`DER` format.
 
@@ -1030,9 +1130,16 @@ class SigningKey(object):
             ``named_curve`` and ``explicit``.
             Ignored for EdDSA.
         :type valid_curve_encodings: :term:`set-like object`
+        :param curve_policy: optional admission policy restricting which
+            curves are accepted and whether explicit parameters are allowed.
+            When ``None`` (the default) the historical behaviour is
+            preserved.
+        :type curve_policy: ecdsa.curve_policy.CurvePolicy
 
         :raises MalformedPointError: if the length of encoding doesn't match
             the provided curve or the encoded values is too large
+        :raises ecdsa.curve_policy.CurveAdmissionError: if the curve of the
+            key is not admitted by the policy
         :raises RuntimeError: if the generation of public key from private
             key failed
         :raises UnexpectedDER: if the encoding of the DER file is incorrect
@@ -1093,14 +1200,20 @@ class SigningKey(object):
                     assert algorithm_oid == Ed448.oid
                     curve = Ed448
 
-                return cls.from_string(key_str, curve, None)
+                return cls.from_string(
+                    key_str, curve, None, curve_policy=curve_policy
+                )
 
             if algorithm_oid not in (oid_ecPublicKey, oid_ecDH, oid_ecMQV):
                 raise der.UnexpectedDER(
                     "unexpected algorithm identifier '%s'" % (algorithm_oid,)
                 )
 
-            curve = Curve.from_der(algorithm_identifier, valid_curve_encodings)
+            curve = Curve.from_der(
+                algorithm_identifier,
+                valid_curve_encodings,
+                curve_policy=curve_policy,
+            )
 
             # Up next is an octet string containing an ECPrivateKey. Ignore
             # the optional "attributes" and "publicKey" fields that come after.
@@ -1132,7 +1245,11 @@ class SigningKey(object):
                 raise der.UnexpectedDER(
                     "expected tag 0 in DER privkey, got %d" % tag
                 )
-            curve = Curve.from_der(curve_oid_str, valid_curve_encodings)
+            curve = Curve.from_der(
+                curve_oid_str,
+                valid_curve_encodings,
+                curve_policy=curve_policy,
+            )
 
         # we don't actually care about the following fields
         #
@@ -1151,7 +1268,9 @@ class SigningKey(object):
             privkey_str = (
                 b"\x00" * (curve.baselen - len(privkey_str)) + privkey_str
             )
-        return cls.from_string(privkey_str, curve, hashfunc)
+        return cls.from_string(
+            privkey_str, curve, hashfunc, curve_policy=curve_policy
+        )
 
     def to_string(self):
         """

@@ -2,6 +2,7 @@ from __future__ import division
 
 from six import PY2
 from . import der, ecdsa, ellipticcurve, eddsa
+from .curve_policy import CurveAdmissionError, curves_equal
 from .util import orderlen, number_to_string, string_to_number
 from ._compat import normalise_bytes, bit_length
 
@@ -43,6 +44,8 @@ __all__ = [
     "CHARACTERISTIC_TWO_FIELD_OID",
     "Ed25519",
     "Ed448",
+    "CurvePolicy",
+    "CurveAdmissionError",
 ]
 
 
@@ -168,7 +171,7 @@ class Curve:
         )
 
     @staticmethod
-    def from_der(data, valid_encodings=None):
+    def from_der(data, valid_encodings=None, curve_policy=None):
         """Decode the curve parameters from DER file.
 
         :param data: the binary string to decode the parameters from
@@ -177,6 +180,14 @@ class Curve:
             all (set by passing ``None``), supported ones are ``named_curve``
             and ``explicit``
         :type valid_encodings: :term:`set-like object`
+        :param curve_policy: optional admission policy restricting which
+            curves are accepted and whether explicit parameters are allowed.
+            When ``None`` (the default) every curve supported by the library
+            is accepted, preserving the historical behaviour.
+        :type curve_policy: ecdsa.curve_policy.CurvePolicy
+
+        :raises ecdsa.curve_policy.CurveAdmissionError: if the curve or its
+            encoding is not admitted by the policy
         """
         if not valid_encodings:
             valid_encodings = set(("named_curve", "explicit"))
@@ -193,10 +204,18 @@ class Curve:
             oid, empty = der.remove_object(data)
             if empty:
                 raise der.UnexpectedDER("Unexpected data after OID")
-            return find_curve(oid)
+            curve = find_curve(oid)
+            if curve_policy is not None:
+                curve = curve_policy.admit(curve, explicit=False)
+            return curve
 
         if "explicit" not in valid_encodings:
             raise der.UnexpectedDER("explicit curve parameters not allowed")
+        if curve_policy is not None and not curve_policy.allow_explicit:
+            raise CurveAdmissionError(
+                "explicit curve parameters are not allowed by the curve "
+                "admission policy"
+            )
 
         seq, empty = der.remove_sequence(data)
         if empty:
@@ -231,6 +250,11 @@ class Curve:
                 "Unexpected data after ECParameters.fieldID.Prime-p element"
             )
 
+        # Before touching the attacker supplied parameters with any expensive
+        # operation, enforce the structural and size limits of the policy.
+        if curve_policy is not None:
+            curve_policy.check_structure(prime, order, cofactor, base_bytes)
+
         # decode the ECParameters.curve sequence
         curve_a_bytes, rest = der.remove_octet_string(curve)
         curve_b_bytes, rest = der.remove_octet_string(rest)
@@ -252,6 +276,11 @@ class Curve:
         )
         tmp_curve = Curve("unknown", curve_fp, base, None)
 
+        if curve_policy is not None:
+            # explicit parameters are accepted only when the full set of
+            # domain parameters matches a trusted curve
+            return curve_policy.admit(tmp_curve, explicit=True)
+
         # if the curve matches one of the well-known ones, use the well-known
         # one in preference, as it will have the OID and name associated
         for i in curves:
@@ -260,7 +289,7 @@ class Curve:
         return tmp_curve
 
     @classmethod
-    def from_pem(cls, string, valid_encodings=None):
+    def from_pem(cls, string, valid_encodings=None, curve_policy=None):
         """Decode the curve parameters from PEM file.
 
         :param str string: the text string to decode the parameters from
@@ -268,6 +297,9 @@ class Curve:
             all (set by passing ``None``), supported ones are ``named_curve``
             and ``explicit``
         :type valid_encodings: :term:`set-like object`
+        :param curve_policy: optional admission policy restricting which
+            curves are accepted; see :py:meth:`Curve.from_der` for details.
+        :type curve_policy: ecdsa.curve_policy.CurvePolicy
         """
         if not PY2 and isinstance(string, str):  # pragma: no branch
             string = string.encode()
@@ -277,7 +309,9 @@ class Curve:
             raise der.UnexpectedDER("EC PARAMETERS PEM header not found")
 
         return cls.from_der(
-            der.unpem(string[ec_param_index:]), valid_encodings
+            der.unpem(string[ec_param_index:]),
+            valid_encodings,
+            curve_policy,
         )
 
 
@@ -588,3 +622,7 @@ def curve_by_name(name):
             name, [c.name for c in curves]
         )
     )
+
+
+# re-exported here so that ``from ecdsa.curves import CurvePolicy`` works
+from .curve_policy import CurvePolicy  # noqa: E402

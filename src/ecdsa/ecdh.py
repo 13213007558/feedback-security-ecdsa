@@ -5,6 +5,7 @@ Class for performing Elliptic-curve Diffie-Hellman (ECDH) operations.
 from .util import number_to_string
 from .ellipticcurve import INFINITY
 from .keys import SigningKey, VerifyingKey
+from .curve_policy import CurveAdmissionError
 
 
 __all__ = [
@@ -13,6 +14,7 @@ __all__ = [
     "NoCurveError",
     "InvalidCurveError",
     "InvalidSharedSecretError",
+    "CurveAdmissionError",
 ]
 
 
@@ -50,7 +52,9 @@ class ECDH(object):
     pair, to establish a shared secret over an insecure channel
     """
 
-    def __init__(self, curve=None, private_key=None, public_key=None):
+    def __init__(
+        self, curve=None, private_key=None, public_key=None, curve_policy=None
+    ):
         """
         ECDH init.
 
@@ -65,14 +69,30 @@ class ECDH(object):
         :type private_key: SigningKey
         :param public_key:  `their` public key for ECDH
         :type public_key: VerifyingKey
+        :param curve_policy: optional admission policy restricting which
+            curves are accepted. Both the local curve/private key and the
+            received public key are checked against it, so a key can't be
+            imported first and used with a mismatching curve afterwards.
+            When ``None`` (the default) the historical behaviour is
+            preserved.
+        :type curve_policy: ecdsa.curve_policy.CurvePolicy
         """
         self.curve = curve
+        self.curve_policy = curve_policy
         self.private_key = None
         self.public_key = None
+        if curve is not None:
+            self.set_curve(curve)
         if private_key:
             self.load_private_key(private_key)
         if public_key:
             self.load_received_public_key(public_key)
+
+    def _admit(self, curve):
+        """Run the admission policy over a curve, if one was configured."""
+        if self.curve_policy is not None:
+            return self.curve_policy.admit_curve(curve)
+        return curve
 
     def _get_shared_secret(self, remote_public_key):
         if not self.private_key:
@@ -83,6 +103,11 @@ class ECDH(object):
             raise NoKeyError(
                 "Public key needs to be set to create shared secret"
             )
+        # check the admission of both the local curve and the curve of the
+        # peer public key again, so replacing a key after import can't bypass
+        # the policy
+        self._admit(self.private_key.curve)
+        self._admit(remote_public_key.curve)
         if not (
             self.private_key.curve == self.curve == remote_public_key.curve
         ):
@@ -106,8 +131,11 @@ class ECDH(object):
 
         :param key_curve: curve from `curves` module
         :type key_curve: Curve
+
+        :raises ecdsa.curve_policy.CurveAdmissionError: if a policy is
+            configured and the curve is not admitted by it
         """
-        self.curve = key_curve
+        self.curve = self._admit(key_curve)
 
     def generate_private_key(self):
         """
@@ -133,12 +161,15 @@ class ECDH(object):
         :type private_key: SigningKey
 
         :raises InvalidCurveError: private_key curve not the same as self.curve
+        :raises ecdsa.curve_policy.CurveAdmissionError: if a policy is
+            configured and the private key curve is not admitted by it
 
         :return: public (verifying) key from this private key.
         :rtype: VerifyingKey
         """
+        admitted_curve = self._admit(private_key.curve)
         if not self.curve:
-            self.curve = private_key.curve
+            self.curve = admitted_curve
         if self.curve != private_key.curve:
             raise InvalidCurveError("Curve mismatch.")
         self.private_key = private_key
@@ -163,7 +194,11 @@ class ECDH(object):
         if not self.curve:
             raise NoCurveError("Curve must be set prior to key load.")
         return self.load_private_key(
-            SigningKey.from_string(private_key, curve=self.curve)
+            SigningKey.from_string(
+                private_key,
+                curve=self.curve,
+                curve_policy=self.curve_policy,
+            )
         )
 
     def load_private_key_der(self, private_key_der):
@@ -185,7 +220,11 @@ class ECDH(object):
         :return: public (verifying) key from this private key.
         :rtype: VerifyingKey
         """
-        return self.load_private_key(SigningKey.from_der(private_key_der))
+        return self.load_private_key(
+            SigningKey.from_der(
+                private_key_der, curve_policy=self.curve_policy
+            )
+        )
 
     def load_private_key_pem(self, private_key_pem):
         """
@@ -206,7 +245,11 @@ class ECDH(object):
         :return: public (verifying) key from this private key.
         :rtype: VerifyingKey
         """
-        return self.load_private_key(SigningKey.from_pem(private_key_pem))
+        return self.load_private_key(
+            SigningKey.from_pem(
+                private_key_pem, curve_policy=self.curve_policy
+            )
+        )
 
     def get_public_key(self):
         """
@@ -230,9 +273,12 @@ class ECDH(object):
         :type public_key: VerifyingKey
 
         :raises InvalidCurveError: public_key curve not the same as self.curve
+        :raises ecdsa.curve_policy.CurveAdmissionError: if a policy is
+            configured and the public key curve is not admitted by it
         """
+        admitted_curve = self._admit(public_key.curve)
         if not self.curve:
-            self.curve = public_key.curve
+            self.curve = admitted_curve
         if self.curve != public_key.curve:
             raise InvalidCurveError("Curve mismatch.")
         self.public_key = public_key
@@ -257,7 +303,10 @@ class ECDH(object):
         """
         return self.load_received_public_key(
             VerifyingKey.from_string(
-                public_key_str, self.curve, valid_encodings
+                public_key_str,
+                self.curve,
+                valid_encodings=valid_encodings,
+                curve_policy=self.curve_policy,
             )
         )
 
@@ -277,7 +326,9 @@ class ECDH(object):
         :raises InvalidCurveError: public_key curve not the same as self.curve
         """
         return self.load_received_public_key(
-            VerifyingKey.from_der(public_key_der)
+            VerifyingKey.from_der(
+                public_key_der, curve_policy=self.curve_policy
+            )
         )
 
     def load_received_public_key_pem(self, public_key_pem):
@@ -296,7 +347,9 @@ class ECDH(object):
         :raises InvalidCurveError: public_key curve not the same as self.curve
         """
         return self.load_received_public_key(
-            VerifyingKey.from_pem(public_key_pem)
+            VerifyingKey.from_pem(
+                public_key_pem, curve_policy=self.curve_policy
+            )
         )
 
     def generate_sharedsecret_bytes(self):

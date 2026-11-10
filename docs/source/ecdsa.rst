@@ -13,6 +13,7 @@ Submodules
    :maxdepth: 4
 
    ecdsa.curves
+   ecdsa.curve_policy
    ecdsa.der
    ecdsa.ecdh
    ecdsa.ecdsa

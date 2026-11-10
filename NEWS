@@ -1,3 +1,29 @@
+* Unreleased
+
+New API:
+* ``ecdsa.curve_policy.CurvePolicy``: an optional curve admission policy for
+  verification services that only accept a fixed set of curves. It is passed
+  as the ``curve_policy`` argument to ``VerifyingKey`` and ``SigningKey``
+  import methods (``from_string``, ``from_public_point``, ``from_der``,
+  ``from_pem``, ``from_secret_exponent``), to ``Curve.from_der``/``from_pem``
+  and to the ``ECDH`` constructor and its key loading methods. When no policy
+  is provided every method keeps its historical, unrestricted behaviour.
+* The policy names the trusted curves and whether explicit ECParameters are
+  accepted. When explicit parameters are allowed, they are admitted only when
+  the full set of domain parameters (field prime, curve coefficients, base
+  point, base point order and cofactor) matches a trusted curve; matching only
+  the bit size, name or base point is not enough.
+* Before processing attacker supplied explicit parameters, the policy applies
+  cheap structural and size limits (``max_field_bits`` and
+  ``max_order_bits``, defaulting to 1024 bits), so oversized parameters are
+  rejected before any expensive point arithmetic.
+* ``ECDH`` checks the admission result of both the local curve and the peer
+  public key at load time and again when the shared secret is computed,
+  preventing a curve swap after a successful import.
+* The existing point validity checks and the independent
+  ``valid_encodings``/``valid_curve_encodings`` restrictions are not affected
+  by the policy and can't be disabled through it.
+
 * Release 0.19.2 (26 Mar 2026)
 
 Bug fixes:

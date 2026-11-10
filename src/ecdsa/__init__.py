@@ -42,7 +42,9 @@ from .ecdh import (
     NoCurveError,
     InvalidCurveError,
     InvalidSharedSecretError,
+    CurveAdmissionError,
 )
+from .curve_policy import CurvePolicy
 from .der import UnexpectedDER
 from . import _version
 
